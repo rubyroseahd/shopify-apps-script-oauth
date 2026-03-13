@@ -87,6 +87,13 @@ const MAX_REPORTS_TO_KEEP = 5;
  */
 const RUN_TOKEN = "";
 
+/**
+ * Set to true to share generated report files with anyone who has the link.
+ * When false (default) the file is private to the account that runs the script.
+ * Only enable if you intentionally want inventory data to be publicly readable.
+ */
+const REPORT_SHARE_WITH_LINK = false;
+
 
 // ==============================================================================
 // ██████  OAUTH HELPERS
@@ -104,9 +111,10 @@ const RUN_TOKEN = "";
  *   4. Copy the URL and open it in a browser to start the OAuth flow.
  */
 function buildOAuthInstallUrl() {
-  // A random "nonce" to protect against CSRF attacks.
-  // In production you would store this and verify it in doGet().
+  // Generate a random nonce to guard against CSRF attacks.
+  // It is stored in PropertiesService so the callback can verify it.
   const state = Math.random().toString(36).substring(2, 15);
+  PropertiesService.getScriptProperties().setProperty("oauth_state", state);
 
   const params = new URLSearchParams({
     client_id: SHOPIFY_API_KEY,
@@ -202,7 +210,7 @@ function doGet(e) {
   } catch (err) {
     console.error("doGet error:", err);
     return HtmlService.createHtmlOutput(
-      `<h2>❌ Error</h2><p>${err.message}</p>`
+      `<h2>❌ Error</h2><p>${escapeHtml(String(err.message))}</p>`
     ).setTitle("Error");
   }
 }
@@ -231,12 +239,36 @@ function doGet(e) {
 function handleShopifyOAuthCallback(params) {
   const code  = params.code;
   const shop  = params.shop;   // e.g. "your-store.myshopify.com"
-  const state = params.state;  // nonce — validate if you stored it earlier
+  const state = params.state;
 
   console.log("OAuth callback received.");
   console.log("  Shop:", shop);
   console.log("  State:", state);
   console.log("  Code (first 8 chars):", code ? code.substring(0, 8) + "..." : "MISSING");
+
+  // ── Validate state (CSRF protection) ─────────────────────────────────────
+  const props       = PropertiesService.getScriptProperties();
+  const storedState = props.getProperty("oauth_state");
+  // Consume the stored state immediately so it cannot be reused
+  props.deleteProperty("oauth_state");
+
+  if (!storedState || storedState !== state) {
+    console.error("State mismatch — possible CSRF attempt. Expected:", storedState, "Got:", state);
+    return HtmlService.createHtmlOutput(
+      "<h2>❌ OAuth Error</h2><p>Invalid state parameter. Please start the OAuth flow again.</p>"
+    ).setTitle("OAuth Error");
+  }
+
+  // ── Validate shop against configured store (prevent SSRF) ─────────────────
+  // Only allow the token exchange to target the store this script is configured
+  // for.  Using the incoming `shop` param directly would let an attacker craft
+  // a callback that sends your API secret to an arbitrary host.
+  if (!shop || shop !== SHOPIFY_STORE_URL) {
+    console.error("Shop mismatch — rejecting callback. Expected:", SHOPIFY_STORE_URL, "Got:", shop);
+    return HtmlService.createHtmlOutput(
+      "<h2>❌ OAuth Error</h2><p>Shop parameter does not match the configured store.</p>"
+    ).setTitle("OAuth Error");
+  }
 
   if (!code) {
     return HtmlService.createHtmlOutput(
@@ -245,7 +277,9 @@ function handleShopifyOAuthCallback(params) {
   }
 
   // ── Exchange the code for a permanent access token ────────────────────────
-  const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+  // Always use SHOPIFY_STORE_URL (not the incoming `shop` param) to build the
+  // URL so that the target host is always the configured store.
+  const tokenUrl = `https://${SHOPIFY_STORE_URL}/admin/oauth/access_token`;
 
   const payload = {
     client_id:     SHOPIFY_API_KEY,
@@ -264,7 +298,7 @@ function handleShopifyOAuthCallback(params) {
   } catch (fetchErr) {
     console.error("Token exchange fetch failed:", fetchErr);
     return HtmlService.createHtmlOutput(
-      `<h2>❌ Token Exchange Failed</h2><p>${fetchErr.message}</p>`
+      `<h2>❌ Token Exchange Failed</h2><p>${escapeHtml(String(fetchErr.message))}</p>`
     ).setTitle("OAuth Error");
   }
 
@@ -274,11 +308,12 @@ function handleShopifyOAuthCallback(params) {
   console.log("Token endpoint response code:", statusCode);
 
   if (statusCode !== 200) {
+    // Log the raw body for debugging but do NOT render it in HTML — the body
+    // may contain attacker-influenced content that could cause reflected XSS.
     console.error("Token exchange error body:", body);
     return HtmlService.createHtmlOutput(
       `<h2>❌ Token Exchange Failed (HTTP ${statusCode})</h2>
-       <p>Shopify returned an error. Check the execution logs for details.</p>
-       <pre>${body}</pre>`
+       <p>Shopify returned an error. Check the execution logs for details.</p>`
     ).setTitle("OAuth Error");
   }
 
@@ -386,7 +421,7 @@ function fetchActiveOutOfStockProductsGraphQL() {
             vendor
             handle
             status
-            variants(first: 100) {
+            variants(first: 250) {
               edges {
                 node {
                   id
@@ -398,6 +433,9 @@ function fetchActiveOutOfStockProductsGraphQL() {
                     tracked
                   }
                 }
+              }
+              pageInfo {
+                hasNextPage
               }
             }
           }
@@ -445,6 +483,17 @@ function fetchActiveOutOfStockProductsGraphQL() {
 
     // ── Check each product for out-of-stock variants ───────────────────────
     edges.forEach(({ node: product }) => {
+      // Warn if a product has more variants than the page limit (250).
+      // Shopify supports up to ~2000 variants per product in some plans.
+      // Full variant pagination within a product query is not implemented here;
+      // products with >250 variants may have some out-of-stock variants missed.
+      if (product.variants.pageInfo.hasNextPage) {
+        console.warn(
+          `Product "${product.title}" has more than 250 variants. ` +
+          "Only the first 250 were checked for out-of-stock status."
+        );
+      }
+
       const oosVariants = product.variants.edges
         .map(({ node: v }) => v)
         .filter(v => {
@@ -745,7 +794,12 @@ function saveToDrive(htmlContent) {
   }
 
   const file = folder.createFile(fileName, htmlContent, MimeType.HTML);
-  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+  // Only share the file publicly if explicitly opted in via REPORT_SHARE_WITH_LINK.
+  // Leaving this off (default) keeps inventory data private to the script owner.
+  if (REPORT_SHARE_WITH_LINK) {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  }
 
   const url = file.getUrl();
   console.log("Report saved to Drive:", url);
@@ -768,15 +822,44 @@ function saveToDrive(htmlContent) {
  */
 function logToSheet(message, productCount) {
   try {
-    // Find or create the spreadsheet
+    // ── Locate or create the log spreadsheet ──────────────────────────────
+    // Store the spreadsheet ID in PropertiesService after the first creation
+    // so that future runs can open it directly (by ID) rather than relying on
+    // a name search, which could accidentally open a non-spreadsheet file.
     let ss;
-    const files = DriveApp.getFilesByName("OOS Report Log");
-    if (files.hasNext()) {
-      ss = SpreadsheetApp.open(files.next());
-    } else {
+    const props   = PropertiesService.getScriptProperties();
+    const savedId = props.getProperty("log_spreadsheet_id");
+
+    if (savedId) {
+      try {
+        ss = SpreadsheetApp.openById(savedId);
+      } catch (e) {
+        // Saved ID is stale (e.g., file was deleted) — fall through to create.
+        console.warn("Saved log spreadsheet ID is invalid:", e.message);
+        ss = null;
+      }
+    }
+
+    if (!ss) {
+      // Search among *spreadsheet* files only to avoid opening a same-named
+      // file of a different type (e.g., a plain Google Doc named "OOS Report Log").
+      const files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+      while (files.hasNext()) {
+        const f = files.next();
+        if (f.getName() === "OOS Report Log") {
+          ss = SpreadsheetApp.open(f);
+          break;
+        }
+      }
+    }
+
+    if (!ss) {
       ss = SpreadsheetApp.create("OOS Report Log");
       console.log("Created new log spreadsheet:", ss.getUrl());
     }
+
+    // Cache the ID so future runs avoid the Drive search.
+    props.setProperty("log_spreadsheet_id", ss.getId());
 
     // Find or create the log sheet tab
     let sheet = ss.getSheetByName(LOG_SHEET_NAME);

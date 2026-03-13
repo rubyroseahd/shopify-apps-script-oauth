@@ -212,9 +212,12 @@ https://your-store.myshopify.com/admin/oauth/authorize?client_id=abc123&scope=re
 
 8. **Copy the token** (everything starting with `shpat_`).
 
-> ⚠️ **Tokens are single-use codes**: The `?code=` parameter Shopify sends is
-> one-time only. If you try to open the URL again, you'll get a 400 error.
-> That's fine — you only need the token, which you already captured.
+> ⚠️ **Authorization codes are single-use**: The `?code=` parameter Shopify
+> sends in the redirect is a one-time authorization code — it expires within
+> minutes and can only be exchanged for a token once. If you try to open the
+> same OAuth URL again, you'll get a 400 error because that code has already
+> been used (or has expired). That's fine — you only need the access token
+> (`shpat_...`) that the script logged, which is a long-lived credential.
 
 ---
 
